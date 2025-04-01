@@ -15,9 +15,23 @@
             width: 100%;
             max-width: 500px;
             margin-bottom: 20px;
+            position: relative;
         }
         #qr-video {
             width: 100%;
+            border: 3px solid #ddd;
+            border-radius: 8px;
+        }
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            border: 2px solid red;
+            box-sizing: border-box;
+            display: none;
         }
         .control-section {
             margin-bottom: 20px;
@@ -57,8 +71,31 @@
             background-color: #f8d7da;
             color: #721c24;
         }
+        .info {
+            background-color: #e2f3fc;
+            color: #0c5460;
+        }
         .table-select-wrapper {
             margin-bottom: 15px;
+        }
+        #debug-info {
+            font-family: monospace;
+            font-size: 12px;
+            background-color: #f8f9fa;
+            padding: 10px;
+            margin-top: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+            display: none;
+        }
+        #toggle-debug {
+            background-color: #6c757d;
+            font-size: 12px;
+            padding: 5px 10px;
+        }
+        #camera-select {
+            margin-bottom: 10px;
+            width: 100%;
         }
     </style>
 </head>
@@ -79,13 +116,18 @@
     
     <div class="control-section">
         <h2>Scanner</h2>
+        <select id="camera-select">
+            <option value="">Loading cameras...</option>
+        </select>
         <div id="video-container">
             <video id="qr-video" playsinline></video>
+            <div id="overlay"></div>
         </div>
         
         <div>
             <button id="start-button">Start Camera</button>
             <button id="stop-button" disabled>Stop Camera</button>
+            <button id="toggle-flash" disabled>Toggle Flash</button>
         </div>
     </div>
     
@@ -93,94 +135,278 @@
         <h2>Scanned Results</h2>
         <div id="result">No QR code detected</div>
         <button id="send-button" disabled>Send to Airtable</button>
+        <button id="manual-entry">Enter QR Code Manually</button>
     </div>
     
     <div id="status"></div>
+    
+    <button id="toggle-debug">Show Debug Info</button>
+    <div id="debug-info"></div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const video = document.getElementById('qr-video');
+            const overlay = document.getElementById('overlay');
             const startButton = document.getElementById('start-button');
             const stopButton = document.getElementById('stop-button');
+            const toggleFlashButton = document.getElementById('toggle-flash');
             const sendButton = document.getElementById('send-button');
+            const manualEntryButton = document.getElementById('manual-entry');
             const resultElement = document.getElementById('result');
             const statusElement = document.getElementById('status');
+            const cameraSelect = document.getElementById('camera-select');
+            const debugInfo = document.getElementById('debug-info');
+            const toggleDebugButton = document.getElementById('toggle-debug');
             
             let stream = null;
             let scanning = false;
             let scannedData = null;
             let canvasElement = document.createElement('canvas');
             let canvas = canvasElement.getContext('2d');
+            let flashlight = false;
+            let lastFrameTime = 0;
+            let frameCounts = [];
+            let successfulScans = 0;
             
+            // Event listeners
             startButton.addEventListener('click', startCamera);
             stopButton.addEventListener('click', stopCamera);
             sendButton.addEventListener('click', sendToAirtable);
+            toggleFlashButton.addEventListener('click', toggleFlash);
+            manualEntryButton.addEventListener('click', enterQRManually);
             
-            function startCamera() {
-                if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-                    navigator.mediaDevices.getUserMedia({ 
-                        video: { facingMode: "environment" } 
-                    })
-                    .then(function(mediaStream) {
-                        stream = mediaStream;
-                        video.srcObject = mediaStream;
-                        video.setAttribute('playsinline', true);
+            toggleDebugButton.addEventListener('click', function() {
+                if (debugInfo.style.display === 'none' || !debugInfo.style.display) {
+                    debugInfo.style.display = 'block';
+                    toggleDebugButton.textContent = 'Hide Debug Info';
+                } else {
+                    debugInfo.style.display = 'none';
+                    toggleDebugButton.textContent = 'Show Debug Info';
+                }
+            });
+            
+            // Load available cameras
+            async function listCameras() {
+                try {
+                    log('Listing available cameras...');
+                    const devices = await navigator.mediaDevices.enumerateDevices();
+                    const videoDevices = devices.filter(device => device.kind === 'videoinput');
+                    
+                    log(`Found ${videoDevices.length} video devices`);
+                    
+                    if (videoDevices.length === 0) {
+                        updateStatus('No cameras found on your device', 'error');
+                        cameraSelect.innerHTML = '<option value="">No cameras available</option>';
+                        return;
+                    }
+                    
+                    cameraSelect.innerHTML = '';
+                    videoDevices.forEach((device, index) => {
+                        const option = document.createElement('option');
+                        option.value = device.deviceId;
+                        option.text = device.label || `Camera ${index + 1}`;
+                        cameraSelect.appendChild(option);
+                        log(`Added camera: ${option.text} (${device.deviceId})`);
+                    });
+                    
+                    // Try to select the back camera by default
+                    const backCamera = videoDevices.find(device => 
+                        device.label.toLowerCase().includes('back') || 
+                        device.label.toLowerCase().includes('rear'));
+                    
+                    if (backCamera) {
+                        cameraSelect.value = backCamera.deviceId;
+                        log('Selected back camera by default');
+                    }
+                    
+                } catch (error) {
+                    log(`Error listing cameras: ${error.message}`);
+                    updateStatus(`Error listing cameras: ${error.message}`, 'error');
+                    cameraSelect.innerHTML = '<option value="">Error listing cameras</option>';
+                }
+            }
+            
+            async function startCamera() {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    updateStatus('Your browser does not support camera access', 'error');
+                    log('MediaDevices API not supported');
+                    return;
+                }
+                
+                try {
+                    const constraints = { 
+                        video: { 
+                            facingMode: "environment",
+                            width: { ideal: 1280 },
+                            height: { ideal: 720 }
+                        },
+                        audio: false
+                    };
+                    
+                    // Use selected camera if available
+                    if (cameraSelect.value) {
+                        constraints.video = { 
+                            deviceId: { exact: cameraSelect.value },
+                            width: { ideal: 1280 },
+                            height: { ideal: 720 }
+                        };
+                        log(`Using selected camera: ${cameraSelect.value}`);
+                    } else {
+                        log('Using environment facing camera (default)');
+                    }
+                    
+                    log('Requesting camera access with constraints: ' + JSON.stringify(constraints));
+                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                    
+                    video.srcObject = stream;
+                    video.setAttribute('playsinline', true);
+                    
+                    log('Camera stream obtained successfully');
+                    
+                    // Check if flashlight is available
+                    const track = stream.getVideoTracks()[0];
+                    const capabilities = track.getCapabilities();
+                    
+                    if (capabilities.torch) {
+                        toggleFlashButton.disabled = false;
+                        log('Flashlight capability detected');
+                    } else {
+                        toggleFlashButton.disabled = true;
+                        log('No flashlight capability detected');
+                    }
+                    
+                    video.onloadedmetadata = function() {
+                        log(`Video dimensions: ${video.videoWidth}x${video.videoHeight}`);
+                        canvasElement.width = video.videoWidth;
+                        canvasElement.height = video.videoHeight;
                         video.play();
                         scanning = true;
                         startButton.disabled = true;
                         stopButton.disabled = false;
-                        scan();
                         updateStatus('Camera started', 'success');
-                    })
-                    .catch(function(error) {
-                        console.error('Error accessing the camera:', error);
-                        updateStatus('Error: ' + error.message, 'error');
-                    });
-                } else {
-                    updateStatus('Your browser does not support camera access', 'error');
+                        requestAnimationFrame(scan);
+                    };
+                    
+                } catch (error) {
+                    console.error('Error accessing the camera:', error);
+                    log(`Camera access error: ${error.message}`);
+                    updateStatus('Error: ' + error.message, 'error');
                 }
             }
             
             function stopCamera() {
                 if (stream) {
+                    log('Stopping camera stream');
                     stream.getTracks().forEach(track => track.stop());
                     video.srcObject = null;
                     scanning = false;
                     startButton.disabled = false;
                     stopButton.disabled = true;
-                    updateStatus('Camera stopped', 'success');
+                    toggleFlashButton.disabled = true;
+                    updateStatus('Camera stopped', 'info');
                 }
             }
             
-            function scan() {
+            function toggleFlash() {
+                if (!stream) return;
+                
+                const track = stream.getVideoTracks()[0];
+                const capabilities = track.getCapabilities();
+                
+                if (capabilities.torch) {
+                    flashlight = !flashlight;
+                    track.applyConstraints({
+                        advanced: [{ torch: flashlight }]
+                    });
+                    log(`Flashlight turned ${flashlight ? 'ON' : 'OFF'}`);
+                    toggleFlashButton.textContent = flashlight ? 'Turn Flash OFF' : 'Turn Flash ON';
+                }
+            }
+            
+            function scan(timestamp) {
                 if (!scanning) return;
+                
+                // Calculate FPS
+                if (lastFrameTime > 0) {
+                    const fps = 1000 / (timestamp - lastFrameTime);
+                    frameCounts.push(fps);
+                    if (frameCounts.length > 30) frameCounts.shift();
+                }
+                lastFrameTime = timestamp;
                 
                 if (video.readyState === video.HAVE_ENOUGH_DATA) {
                     canvasElement.height = video.videoHeight;
                     canvasElement.width = video.videoWidth;
                     canvas.drawImage(video, 0, 0, canvasElement.width, canvasElement.height);
                     
-                    const imageData = canvas.getImageData(0, 0, canvasElement.width, canvasElement.height);
-                    const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                        inversionAttempts: "dontInvert",
-                    });
-                    
-                    if (code) {
-                        // QR code detected
-                        scannedData = code.data;
-                        resultElement.textContent = 'Scanned: ' + scannedData;
-                        sendButton.disabled = false;
-                        // Optional: beep or vibrate here
+                    try {
+                        const imageData = canvas.getImageData(0, 0, canvasElement.width, canvasElement.height);
+                        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                            inversionAttempts: "dontInvert",
+                        });
                         
-                        // Uncomment to pause after detection
-                        // scanning = false;
-                        // startButton.disabled = false;
-                        // stopButton.disabled = true;
+                        if (code) {
+                            // QR code detected
+                            successfulScans++;
+                            
+                            // Show detection overlay
+                            overlay.style.display = 'block';
+                            overlay.style.top = `${(code.location.topLeftCorner.y / canvasElement.height) * 100}%`;
+                            overlay.style.left = `${(code.location.topLeftCorner.x / canvasElement.width) * 100}%`;
+                            overlay.style.width = `${(code.location.bottomRightCorner.x - code.location.topLeftCorner.x) / canvasElement.width * 100}%`;
+                            overlay.style.height = `${(code.location.bottomRightCorner.y - code.location.topLeftCorner.y) / canvasElement.height * 100}%`;
+                            
+                            scannedData = code.data;
+                            resultElement.textContent = 'Scanned: ' + scannedData;
+                            sendButton.disabled = false;
+                            
+                            log(`QR Code detected: ${scannedData}`);
+                            
+                            // Give audio feedback
+                            try {
+                                const beep = new Audio("data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559EEAxQp+PurWQcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hQFgtFn+DrvmkgBzOL0fPTgjMGHm7A7+OZSA0PVK/n77BXGApBmd7xwm0hBi+FzvTLeDQHIG/C8OWWRw0PVbDo8LBYGQo/mN7ywm4jBiyEzfTNejUHHm7B8OaYSQ0OVLDo8LFYGQo+l97zxHAkBiuDy/TPezYIHW3A8OeaSg0OU6/o8LJaGgo9lt7zxXIlBiqByPTRfjgJHGu+8OibTQ8MUa3o8LRcGwk7lN3zx3QmBid/x/TTgDkKGmm98emfUBAKT6vo8bdgHQg5ktzzxnYoBiV9xPTVgjwLGGa78euhVBIHTKjm8bxkIAU2jtnyyHkrBSF5wPPXhT8OFmO48OyjWRQFSaXk8MBpIwQyi9fyyHwtBR92vPHaiEURFGG18OynXBYDRqPi775sJwMvhtTyynoxBRtyt+/cjEoVEl6y7emmYBkCQ5/g78FxKwIrgtDyzX81BRlvs+7ekk4YEFqv6+m pYx0APpzd7sJ1MAEne83y0YQ8BRVqre3gmFMdDVSp6OetaCAAN5fZ7cR6NwEkedPy04dBCBJlp+nhm1kjC06m5OixcyYAMZDU68h/PQATY9/v1Y1KDw1fpOXerGYcAEeW1uvHfjsALYvN6c2GRQUPXNfp146SFA5Zn+DdsGwfAEOQz+XLhEIAKIXI5NCJSggLWdHm1pGXGAxUmt7ZtHEiAD6Ly+PMiUcBJX7E4dKPVQ0KVcvk0peaHQlQltjTtHcmATmGxuDLjUsEInjA3dOSWxAGUMXez5mfIwhLkdHPtX4rAS5/v93MklAGHXO83NSWYRMETsDZ0J6lKQdFi8rNto0gASJ5u9rOlVUIGW2025OdaxgJSrbT0KStMgc7g8TDB6StJg01fLfMEqy3MRFGhsLCCaayKw8vetLCFrDOMAw2flRXBwo3LSUzQ1lvcYOUpb3T6vYPC2WYmZNWQCImHTI0NDQzLiYkIykzQldxhZaju9j2RSY5KyUbEAwJDBIjOlh5gZOfs8jbL0qGjoZ0YE05LSgkHBsUDQ0ICA0YKUVog5urwdsFO3vj+/Lj2s7Cv7q4t7i9xs/d7iknHRgLAQEEDBg1TXGOo7fM5ORSf7TW5e/u7erj2tXT2uLv/hnDxr21qZmLfGtbRzgqHRQLAggOFCc9vM3BsZV5YE0/Ni4qJiMmKjRDbcng+gMPIzM/SElEOi4iGhUQERsnT2OGudz0BSBFZ3yLkpGMgXNkU0IyJCEhKTV1tc7uOszf6u7u6uDSxLu0srK2w9Pn/DZJWm13gIJ/eGpZRTcnGRIQFCM3cAiKorexb1pALRwUDxIYJTxYgx9tgJGikYRvXEUzJRwYFyAw4LjMnJKAa1dEMCQaFBQaJ2KEqetUyePt8vLt4tHAta6pqK2ywtT4l+j3/v36+fPp39LGu66jl4+Lj5uovdr1DiAuOD9APzsuIhoTDxETH2LJ7JCVmJiWjoR3Z1I+LScmLTxOXFI+QUpUXGNsb2tlWUpCPkFOdeyxsrk8M3eRn6SmoJmPgnZoVUQ0KysxQcno/CQ5S2JweHt3dGlbSTs0MDtYHcbSkZOQrGta5ygmJypBW8b2ETh1gpCRjoZ7bVlFMyUcFBMXICxEXi1LLDQ6P0JDQ0A6MS0sLzpJXXKEkZ6su8bN0tTT0c3GuK+pqqalp62yt73EytHV19bSysC0qaGb");
+                                beep.play();
+                            } catch (e) {
+                                log('Audio feedback failed: ' + e.message);
+                            }
+                            
+                            // Optional: pause scanning after detection
+                            // scanning = false;
+                            // startButton.disabled = false;
+                            // stopButton.disabled = true;
+                        } else {
+                            overlay.style.display = 'none';
+                        }
+                    } catch (error) {
+                        log(`Error processing frame: ${error.message}`);
                     }
                 }
                 
+                // Update debug info periodically
+                if (timestamp % 500 < 20) {
+                    const avgFps = frameCounts.length > 0 ? frameCounts.reduce((a, b) => a + b, 0) / frameCounts.length : 0;
+                    updateDebugInfo({
+                        resolution: `${canvasElement.width}x${canvasElement.height}`,
+                        fps: avgFps.toFixed(1),
+                        successfulScans: successfulScans,
+                        browser: navigator.userAgent,
+                        jsQR: typeof jsQR !== 'undefined' ? 'Loaded' : 'Not loaded',
+                        mediaState: video.readyState
+                    });
+                }
+                
                 requestAnimationFrame(scan);
+            }
+            
+            function enterQRManually() {
+                const manualData = prompt("Enter QR code data manually:");
+                if (manualData && manualData.trim() !== '') {
+                    scannedData = manualData.trim();
+                    resultElement.textContent = 'Manually entered: ' + scannedData;
+                    sendButton.disabled = false;
+                    log(`QR Code entered manually: ${scannedData}`);
+                }
             }
             
             function sendToAirtable() {
@@ -205,6 +431,9 @@
                 };
                 record.fields[fieldName] = scannedData;
                 
+                log(`Sending data to Airtable: Base ID: ${baseId}, Table: ${tableName}, Field: ${fieldName}`);
+                updateStatus('Sending data to Airtable...', 'info');
+                
                 // Send the data to Airtable
                 fetch(`https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}`, {
                     method: 'POST',
@@ -217,6 +446,7 @@
                     })
                 })
                 .then(response => {
+                    log(`Airtable response status: ${response.status}`);
                     if (!response.ok) {
                         throw new Error(`HTTP error ${response.status}`);
                     }
@@ -224,6 +454,7 @@
                 })
                 .then(data => {
                     console.log('Success:', data);
+                    log(`Data successfully sent to Airtable: ${JSON.stringify(data)}`);
                     updateStatus('Data successfully sent to Airtable!', 'success');
                     // Reset for next scan
                     scannedData = null;
@@ -232,6 +463,7 @@
                 })
                 .catch(error => {
                     console.error('Error sending to Airtable:', error);
+                    log(`Error sending to Airtable: ${error.message}`);
                     updateStatus('Error sending to Airtable: ' + error.message, 'error');
                 });
             }
@@ -240,6 +472,26 @@
                 statusElement.textContent = message;
                 statusElement.className = type;
             }
+            
+            function log(message) {
+                const timestamp = new Date().toLocaleTimeString();
+                const logMessage = `[${timestamp}] ${message}`;
+                debugInfo.innerHTML += logMessage + '<br>';
+                debugInfo.scrollTop = debugInfo.scrollHeight;
+                console.log(logMessage);
+            }
+            
+            function updateDebugInfo(info) {
+                let html = '<strong>Debug Information:</strong><br>';
+                for (const [key, value] of Object.entries(info)) {
+                    html += `${key}: ${value}<br>`;
+                }
+                debugInfo.innerHTML = html;
+            }
+            
+            // Initialize
+            log('Application initialized');
+            listCameras();
         });
     </script>
 </body>
